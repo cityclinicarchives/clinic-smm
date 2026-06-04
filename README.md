@@ -1,0 +1,801 @@
+# clinic-smm-manager — semantic reconstruction baseline step 1
+
+Эта версия добавляет первый этап новой дешевой архитектуры реконструкции инфографик:
+
+```text
+Upload infographic
+→ one multimodal semantic analysis call
+→ Visual Entity Map
+→ Semantic PNG Plan
+→ Design Blueprint
+→ Post draft
+→ QA checklist
+```
+
+## Новый endpoint
+
+```text
+POST /assets/{asset_id}/semantic-reconstruction/analyze
+```
+
+Он создает `ProjectState` со следующими разделами:
+
+```text
+analysis_state
+visual_entity_map
+semantic_png_plan
+design_blueprint
+post
+qa_checklist
+continuation_package
+```
+
+## Что важно
+
+- Никаких hardcoded правил под конкретную инфографику.
+- Регион: Россия / Москва / Средняя полоса России.
+- На этом шаге программа НЕ генерирует финальную картинку.
+- Она только создает смысловую карту и план для последующих дешевых этапов.
+
+## Рекомендуемая модель
+
+Для первого мультимодального аналитического этапа выбрана модель:
+
+```text
+OPENAI_MODEL=gpt-5.5
+```
+
+Причина: этот этап самый важный для качества всей реконструкции. Он должен одновременно понимать изображение, медицинский смысл, визуальную структуру, региональную уместность и возвращать строгий JSON-план. Для экономии на следующих этапах лучше сделать один качественный аналитический вызов, чем несколько слабых повторных вызовов.
+
+На Railway установите переменную:
+
+```text
+OPENAI_MODEL=gpt-5.5
+```
+
+
+## v41 step1 Telegram test patch
+
+Telegram now starts only the first stage of the new architecture for uploaded infographic assets.
+
+Button:
+
+```text
+🧠 Анализировать инфографику (v41)
+```
+
+It runs semantic analysis equivalent to:
+
+```text
+POST /assets/{asset_id}/semantic-reconstruction/analyze
+```
+
+The full JSON analysis is saved to:
+
+```text
+storage/analysis/
+```
+
+This stage is intentionally limited to analysis only: visual entities, semantic PNG plan, design blueprint, post draft and QA checklist.
+
+## v41.1 compact semantic reconstruction
+
+Commands in Telegram:
+
+- `/list_analysis` — list saved semantic-analysis JSON files.
+- `/get_analysis 23` — download compact v41.1 JSON for asset 23.
+- `/generate_semantic_png 23` — generate semantic PNG assets from `semantic_png_plan`.
+- `/compose_reconstruction 23` — compose final 1080x1350 infographic from `design_blueprint`, `content_pack`, and saved semantic PNG assets.
+
+Saved files:
+
+- `storage/analysis/asset-*-state-*-semantic-analysis.json`
+- `storage/semantic_png/asset-*/state-*/*.png`
+- `storage/reconstructions/asset-*-state-*-reconstruction.png`
+
+Important: these files are stored inside Railway filesystem unless you connect a Railway Volume or external storage.
+
+## v41.2 changes: editorial replacement review + source-preserving PNG extraction
+
+This build adds two stabilization changes:
+
+1. Semantic analysis now asks the model to run a `replacement_review` before removing or merging a comparison-card entity. The model must consider regional, thematic, and medical analogs first. Removal is allowed, but only after explaining why replacement is not suitable.
+2. Semantic PNG tasks now include `quality_strategy` and `source_crop_hint.relative_box`. For `extract_from_source` tasks, the generator first tries to crop directly from the original Telegram image and saves the crop at native source resolution without AI regeneration/upscaling. AI image generation is used for `generate_new`, `regenerate_high_detail`, `redraw_from_reference`, or when a usable crop hint is unavailable.
+
+
+## v41.3 cost tracking
+
+This build adds estimated cost tracking for the v41 pipeline.
+
+Telegram messages now show an approximate cost block after:
+
+- `/analyze_source` / v41 semantic analysis button
+- `/generate_semantic_png 23`
+
+The estimate includes:
+
+- input/output tokens for text model calls when OpenAI returns `usage`;
+- number of image generations for Semantic PNG;
+- estimated USD cost;
+- a warning if the model is unknown in the local price table.
+
+Cost logs are also appended to:
+
+```text
+storage/costs/cost-log.jsonl
+```
+
+The JSON analysis includes:
+
+```text
+payload.analysis_state.cost_estimate
+payload.custom.cost_estimate
+```
+
+The Semantic PNG manifest includes:
+
+```text
+storage/semantic_png/asset-*/state-*/manifest.json
+```
+
+with `cost_estimate`.
+
+Pricing can be overridden in Railway Variables:
+
+```text
+COST_TRACKING_ENABLED=true
+COST_TEXT_INPUT_USD_PER_1M=0
+COST_TEXT_OUTPUT_USD_PER_1M=0
+COST_IMAGE_1024_USD=0
+```
+
+Leave values as `0` to use the built-in default price table. The estimate is not a billing document; actual OpenAI charges can differ because of current pricing, image quality/size, prompt caching, retries, and account settings.
+
+## v41.2 Semantic PNG extraction fix
+
+This build improves the Semantic PNG step:
+
+- `semantic_png_plan` prompt now requires safe crop boxes with a small internal margin and explicit exclusion of old labels/UI.
+- `extract_from_source` now adds a modest safe crop margin to avoid cutting circle borders, insect legs/wings, and outlines.
+- Background cleanup is now border-flood based: it removes only the page background connected to crop edges and preserves skin gradients.
+- A text-fragment cleanup pass removes small disconnected dark components near crop edges to reduce leftover English labels.
+- Extracted PNGs are saved at native crop resolution; no artificial upscale is applied.
+- Generated replacement PNG prompts now use a stronger style lock: same round skin visual, contour, palette, scale, and illustration density as preserved source cards.
+
+## v41 update: edge-aware semantic PNG extraction
+
+This version improves `extract_from_source` PNG extraction without extra AI image calls:
+
+- wide crop is treated only as a search area;
+- border-connected background is removed by edge-aware flood fill;
+- extraction no longer assumes circular objects;
+- disconnected text-like fragments near crop edges are removed;
+- object is trimmed to its visible foreground bbox and padded on a transparent square canvas;
+- no artificial upscaling is applied to source crops.
+
+Expected effect: fewer cut contours, fewer leftover labels, less old beige/white background, more stable semantic PNGs across round medical visuals and irregular foreground objects.
+
+## v41.1 Persistent semantic analysis storage
+
+Дорогой этап `semantic_analysis` теперь сохраняется не только в `storage/analysis`, но и в PostgreSQL в таблицу `semantic_analyses`.
+
+Зачем это нужно:
+- Railway может очищать локальные файлы после redeploy/restart.
+- Повторный v41-анализ стоит денег.
+- Команды `/generate_semantic_png <asset_id>` и `/compose_reconstruction <asset_id>` должны переиспользовать уже сохраненный анализ.
+
+Поведение команд:
+- `/list_analysis` сначала показывает анализы из PostgreSQL.
+- `/get_analysis 23` выгружает JSON из PostgreSQL во временный файл и отправляет его в Telegram.
+- `/generate_semantic_png 23` сначала читает анализ из PostgreSQL, и только если его нет — ищет старый файл в `storage/analysis`.
+
+Новая таблица создается автоматически при старте приложения через `Base.metadata.create_all()`. Мини-миграция также добавляет недостающие поля через `ensure_database_schema()`.
+
+## v41.3 Safe text artifact detector for Semantic PNG
+
+This build adds a safer text-removal pass after edge-aware background extraction:
+
+- finds connected foreground components on the transparent PNG;
+- protects the largest/main object and all nearby components, so insect legs, antennae, wings, outlines and small attached details are preserved;
+- detects detached dark components aligned into horizontal rows, which usually correspond to old labels such as `Common Ant`, `Wasp / Yellow Jacket`, `Mosquito`, etc.;
+- removes detached small dark text-like rows and tiny detached specks left by old captions;
+- removes isolated detached thin line artifacts;
+- deliberately does **not** remove text that touches the main object. Such cases should later be sent to an AI/refine fallback, because classical cleanup could damage the semantic object.
+
+This is a no-extra-cost Python cleanup stage. It does not use OCR or OpenAI image calls.
+
+## v41 line-based text suppression
+
+В этой версии Semantic PNG extractor доработан относительно `safe-text-detector`:
+
+- добавлено подавление горизонтальных строк текста после edge-aware удаления фона;
+- мелкие темные компоненты группируются по строкам, чтобы удалять остатки старых подписей вроде `Common Ant`, `Wasp / Yellow Jacket` и точечные фрагменты над объектом;
+- компоненты, которые касаются или находятся очень близко к крупному foreground-объекту, защищаются и не удаляются — это снижает риск отрезать лапки, усики, крылья и контуры насекомых;
+- если текст реально касается объекта, Python оставляет его для будущего AI/refine-fallback, чтобы не повредить объект.
+
+Команды для тестирования:
+
+```text
+/generate_semantic_png 22
+/get_semantic_png 22
+/compose_reconstruction 22
+```
+
+`/get_semantic_png` отправляет отдельные PNG-файлы в Telegram для ручной проверки extractor.
+
+### v41 keep-main-object-cluster extractor
+
+Добавлен строгий режим очистки Semantic PNG после edge-aware удаления фона:
+
+- программа находит главный foreground-кластер объекта;
+- сохраняет главный связанный объект и очень близкие связанные детали;
+- удаляет всё, что не связано с главным объектом: остатки текста, одиночные буквы, точки, вертикальные линии и другие артефакты;
+- если текст физически касается объекта, Python его не удаляет, чтобы не повредить лапки/крылья/контуры. Такой редкий случай позже должен уходить в AI refine fallback.
+
+Тест:
+
+```text
+/generate_semantic_png 22
+/get_semantic_png 22
+/compose_reconstruction 22
+```
+
+## v41 strict main-object mode
+
+Added a stricter extraction cleanup mode for `extract_from_source` semantic PNGs:
+
+- keeps the largest foreground connected object cluster;
+- keeps only components that physically touch the main cluster, with 1px tolerance;
+- deletes every detached component after edge-aware background removal;
+- removes leftover caption fragments, stray dots and vertical mask strokes more aggressively;
+- if a future semantic PNG intentionally contains multiple detached objects, the analyzer should explicitly mark it as a multi-component extraction case before using a softer mode.
+
+## v41.2-cost-compact
+
+Оптимизация стоимости Semantic Analysis:
+
+- промпт переведен в компактный режим;
+- убраны дубли между `visual_entity_map`, `semantic_png_plan`, `design_blueprint` и `content_pack`;
+- `visual_entity_map` хранит только редакторское решение по сущности;
+- все технические PNG-инструкции хранятся только в `semantic_png_plan`;
+- `replacement_review` сокращен до компактного формата: `entity_id/source/issue/decision/replacement/reason`;
+- `medical_editorial_audit` и `qa_checklist` ограничены по длине;
+- сохранена совместимость со старым verbose JSON.
+
+Ожидаемый эффект: снижение output tokens примерно в 2 раза без потери качества решений.
+
+
+## Hotfix: /get_semantic_png без бесконечной отправки
+
+Команда `/get_semantic_png <asset_id>` больше не отправляет PNG по одному из webhook-обработчика.
+Теперь она собирает все Semantic PNG в один ZIP и отправляет одним документом.
+
+Причина: длинная синхронная отправка 10–20 файлов может не успеть вернуть Telegram HTTP 200. Telegram повторяет тот же update, из-за чего создается впечатление бесконечной отправки PNG.
+
+Также добавлена защита от повторного запуска одной и той же отправки: если ZIP для того же chat_id и asset_id уже готовится, повторная команда игнорируется.
+
+## v41 Composer Cyrillic font fix
+
+- Финальный Composer теперь явно ищет шрифт с поддержкой кириллицы.
+- Основной fallback: DejaVu Sans из Matplotlib, поэтому кириллица должна работать даже если системные шрифты в Railway отсутствуют.
+- Текст в заголовке, карточках и футере подбирает размер автоматически и переносится внутри выделенного блока.
+- Composer больше не обрезает список карточек до 10: сетка определяется по design_blueprint и количеству карточек, например 4×4 для 16 карточек.
+- `/get_semantic_png` отправляет один ZIP-архив, чтобы Telegram не повторял webhook update из-за долгой отправки множества файлов.
+
+## v41 Persistent artifacts: Cloudflare R2 + PostgreSQL registry
+
+Эта версия добавляет постоянное хранение промежуточных и финальных файлов реконструкции.
+
+Архитектура хранения:
+
+- PostgreSQL: дорогой semantic-analysis JSON, метаданные файлов, storage keys.
+- Cloudflare R2: Semantic PNG, manifest, blueprint.json, финальные reconstruction PNG.
+- Railway local filesystem: временный cache. Если cache пропал после redeploy, файлы восстанавливаются из R2.
+
+Новые переменные Railway:
+
+```env
+STORAGE_BACKEND=r2
+R2_ACCOUNT_ID=...
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+R2_BUCKET=clinic-smm-assets
+# Optional. Нужен только если включите public bucket/custom domain.
+R2_PUBLIC_BASE_URL=
+```
+
+Если `STORAGE_BACKEND` оставить `local`, программа работает как раньше без R2.
+
+Новая таблица PostgreSQL:
+
+```text
+semantic_asset_files
+```
+
+В ней хранятся:
+
+- `asset_id`
+- `project_state_id`
+- `kind`: `semantic_png`, `manifest`, `blueprint`, `reconstruction`
+- `file_name`
+- `local_path`
+- `storage_backend`
+- `storage_key`
+- `public_url`
+- `mime_type`
+- `size_bytes`
+
+Поведение команд:
+
+- `/generate_semantic_png <asset_id>` сначала проверяет локальные файлы, потом PostgreSQL/R2, и только если файла нет — генерирует заново.
+- `/compose_reconstruction <asset_id>` подтягивает отсутствующие Semantic PNG из R2 и сохраняет финальную картинку обратно в R2.
+- `/get_semantic_png <asset_id>` собирает ZIP из локальных PNG; если локальный cache пуст, PNG восстанавливаются из R2.
+
+R2 object key structure:
+
+```text
+assets/{asset_id}/state-{project_state_id}/semantic_png/*.png
+assets/{asset_id}/state-{project_state_id}/manifest/manifest.json
+assets/{asset_id}/state-{project_state_id}/blueprint/blueprint.json
+assets/{asset_id}/state-{project_state_id}/reconstruction/*.png
+```
+
+## v42 Analysis Layer update
+
+Добавлен первый этап v42 для более качественного semantic analysis:
+
+- `audience=general_public`: тексты должны быть понятны обычному человеку, а не написаны научным языком.
+- `visual_quality_score` и `recommended_action`: анализатор должен сохранять хорошие исходные визуалы, а не перерисовывать всё автоматически.
+- Новый режим решений: `preserve_visual_rewrite_text` и `hybrid`.
+- Принцип минимального исправления: менять только опасные/неясные части исходника, не уничтожая понятность оригинала.
+- Медицинская осторожность переносится в footer/warning block, а не размазывается по каждой карточке.
+- `label_object_consistency`: анализатор должен проверять, совпадает ли число визуальных объектов и подписей, и не удалять объекты только из-за дефектных/обрезанных подписей.
+- Header/footer/text blocks больше не получают auto-created semantic PNG task, если это обычный текст, который должен набрать Composer.
+
+## v42.1 Analysis Layer hotfix
+
+This build tightens the v42 analysis contract:
+
+- Backend no longer auto-creates Semantic PNG tasks for entities missing from `semantic_png_plan`.
+- Header/footer/warning/text/layout entities are rendered by Composer and must not become PNG tasks.
+- Validation now flags conflicts such as `recommended_action=preserve` with `operation=generate_new`.
+- High-quality visuals (`visual_quality_score >= 80`) are expected to use extraction, not regeneration, unless explicitly marked `replace`.
+- Label/object mismatch is surfaced as a validation warning so defective sources can be handled explicitly.
+
+## v42.2 Compact JSON
+
+Архив 2 уменьшает стоимость дорогого анализа без изменения downstream-контракта для Semantic PNG, Composer, PostgreSQL и R2.
+
+Изменения:
+- schema_version: `v42.2-compact`;
+- входящий prompt стал короче;
+- output JSON стал жестче ограничен по длине;
+- `replacement_review` хранит только проблемные/измененные сущности;
+- `visual_entity_map` хранит только решение по объекту;
+- подробности extraction/generation остаются только в `semantic_png_plan`;
+- `design_blueprint` и `content_pack` сохраняют данные, нужные Composer, но без длинных дублей;
+- лимиты снижены для `post`, `qa_checklist`, `image_composition_prompt`, `medical_editorial_audit`.
+
+Ожидаемый эффект: снижение output tokens примерно на 25–45% по сравнению с v42.1 при сохранении качества решений.
+
+## v42.3 Semantic PNG reliability hotfix
+
+This build adds three safeguards to the Semantic PNG stage:
+
+1. **Crop expansion + clipping retry**
+   - `source_crop_hint.relative_box` is treated as an approximate hint, not as a final crop.
+   - The extractor expands the crop before processing.
+   - If foreground pixels touch the crop edge after background removal, the extractor retries with a wider crop.
+   - This is intended to prevent clipped insects, wings, legs, circular outlines and other thin details.
+
+2. **No silent fallback for failed AI image generation**
+   - Failed `generate_new` image calls no longer create a placeholder PNG and report success.
+   - Failures are saved in `manifest.json` and shown in Telegram, for example:
+     - `png_002: AI generation failed — moderation_blocked`
+     - `png_005: AI generation failed — invalid_size`
+
+3. **Detailed Semantic PNG report**
+   Telegram now reports counts separately:
+   - extracted from source;
+   - generated by AI;
+   - reused from local/R2 storage;
+   - fallback placeholders;
+   - failed AI generations.
+
+The image cost estimate is based only on successful AI image generation calls. Extracted and reused PNGs are counted as free operations.
+
+## v42.4 Semantic PNG cache delete commands
+
+Добавлены команды для очистки сохраненных Semantic PNG перед повторным тестом extractor/generator:
+
+- `/delete_semantic_png 26` — удалить весь пакет Semantic PNG для исходника `#26`.
+- `/delete_semantic_png 26 all` — то же самое явно.
+- `/delete_semantic_png 26 png_002` — удалить один PNG по `png_id`/префиксу имени файла.
+
+Команда удаляет:
+
+- локальные файлы из `storage/semantic_png/...`;
+- R2 objects, если они зарегистрированы в PostgreSQL;
+- строки `semantic_asset_files` для `kind=semantic_png`;
+- `manifest` при удалении всего пакета.
+
+После удаления можно выполнить `/generate_semantic_png 26`, и система не возьмет старые PNG из кэша.
+
+## v42.4.1 R2/PostgreSQL cache consistency hotfix
+
+Исправлена ситуация, когда пользователь удалял PNG вручную в Cloudflare R2, но PostgreSQL продолжал хранить строки о готовых файлах, и `/generate_semantic_png` ошибочно считал, что PNG уже есть.
+
+Теперь перед reuse программа проверяет физическое наличие объекта в R2:
+
+- если строка в PostgreSQL есть, но объекта в R2 нет — строка считается stale и удаляется;
+- stale local cache тоже очищается;
+- `/generate_semantic_png <asset_id>` после ручного удаления из R2 заново извлекает/генерирует отсутствующие PNG;
+- `/delete_semantic_png <asset_id>` синхронно чистит local cache, R2 и PostgreSQL registry.
+
+Это позволяет безопасно тестировать новые версии extractor/generator без повторного semantic-analysis.
+
+
+### v42 Image API size hotfix
+
+AI-generated Semantic PNG now always uses the OpenAI-supported request size `1024x1024`.
+Dynamic PNG sizing is applied only after successful generation: the generated image is downscaled locally to the layout-derived target size (for example 270/360/512 px).
+This prevents `invalid_size` errors for small sizes such as `256x256`.
+
+
+## v42 Style-lock groups
+
+Добавлен универсальный механизм визуальной матрицы объектов:
+
+- анализатор создает `visual_template_groups`, если 3+ карточек имеют общий шаблон;
+- для `template_mode=shared` генератор Semantic PNG сохраняет композицию, масштаб, палитру, толщину линий и детализацию группы;
+- механизм универсальный: работает не только для укусов, но и для глаз, зубов, суставов, эмбрионов и любых однотипных медицинских визуалов;
+- для `generate_new` внутри shared-группы используется `reference_png_id` / `reference_entity_id`;
+- AI Semantic PNG генерируются через OpenAI как `1024x1024`, `quality=low`, затем локально уменьшаются до размера, рассчитанного из сетки Composer.
+
+Переменная окружения:
+
+```env
+OPENAI_IMAGE_QUALITY=low
+```
+
+Для отладки отчет `/generate_semantic_png` показывает количество style-lock групп и выбранный reference.
+
+## v42 Reference Image Style Lock
+
+Для `visual_template_groups` с `template_mode=shared` генератор теперь пытается передавать реальный reference PNG в OpenAI Images Edit endpoint, а не только писать его имя в prompt.
+
+Логика:
+
+- если `generate_new` находится в shared-группе;
+- выбранный `reference_png_id` уже извлечен/найден в R2/создан из исходника;
+- генератор вызывает image edit с reference PNG как визуальным стилевым шаблоном;
+- если reference-edit не сработал, выполняется fallback к обычной text-to-image генерации;
+- Telegram-отчет показывает `Reference image used` и `Reference image fidelity`.
+
+Новые переменные окружения:
+
+```env
+OPENAI_IMAGE_QUALITY=low
+OPENAI_IMAGE_INPUT_FIDELITY=low
+```
+
+`quality=low` оставлен для экономии. `OPENAI_IMAGE_INPUT_FIDELITY` можно вручную поднять до `high`, если нужно сильнее держать стиль reference PNG.
+
+## v43.1 Smart Blocks Analysis
+
+Добавлен первый этап Smart Additional Blocks. На этапе semantic-analysis ИИ теперь может возвращать поле `smart_blocks` — это смысловые дополнительные блоки для будущего Composer v43.2.
+
+Поддерживаемые типы блоков:
+
+- `when_doctor` — когда обратиться к врачу;
+- `first_aid` — что сделать сразу;
+- `prevention` — как защититься;
+- `important_note` — важная оговорка;
+- `contraindications` — противопоказания;
+- `how_to_choose` — как выбрать;
+- `checklist` — чек-лист;
+- `normal_variability` — что может быть вариантом нормы;
+- `screening_note` — заметка про обследования/скрининг.
+
+Важно: v43.1 только добавляет анализ и хранение `smart_blocks`. Рисование этих блоков в финальной инфографике будет добавлено на следующем этапе — Composer v43.2.
+
+Принцип работы:
+
+- ИИ выбирает только нужные блоки и пишет короткие пункты;
+- Python нормализует `block_type`, `priority`, `icon_role`, `color_role` и длину текста;
+- Иконки, цвета, фон и расположение блоков будут выбираться Composer'ом из локальной дизайн-системы, без генерации картинок через AI.
+
+
+## v43.1 Smart Blocks Analysis Hotfix
+
+Уточнена нормализация `smart_blocks` перед Composer v43.2:
+
+- максимум 3 smart-блока, как в промпте;
+- дефолтные названия, иконки и цветовые роли задаются Python'ом, если ИИ вернул пустое/слабое значение;
+- дублирующий `important_note` удаляется, если такой же смысл уже есть в `footer_blocks`;
+- добавлены validation warnings: `smart_blocks_trimmed_to_3`, `smart_blocks_all_low_priority`, `smart_blocks_no_safety_block`, `smart_block_duplicated_footer_removed:important_note`;
+- количество пунктов в блоке ограничено 4, чтобы они влезали в будущий Composer v43.2.
+
+## v43.2 Smart Blocks Composer
+
+Composer теперь умеет рисовать `smart_blocks` из semantic-analysis в финальной инфографике.
+
+Что добавлено:
+
+- локальная дизайн-система smart-блоков без AI-генерации;
+- поддержка `when_doctor`, `first_aid`, `prevention`, `important_note`, `contraindications`, `how_to_choose`, `checklist`, `normal_variability`, `screening_note`;
+- автоматический выбор 1–3 блоков по приоритету и количеству карточек;
+- простые программные иконки Pillow: врач/щит/аптечка/галочка/info;
+- цветовые роли: `danger`, `safe`, `care`, `info`, `warning`, `neutral`;
+- карточки smart-блоков размещаются между основной сеткой и footer;
+- Composer никогда не удаляет основные карточки ради smart-блоков: при нехватке места сокращаются smart-блоки.
+
+Принцип:
+
+- ИИ пишет только смысл: тип блока, title, пункты, priority;
+- Python рисует дизайн: фон, цвет, иконку, шрифт, переносы, расположение;
+- блоки не создают дополнительных затрат OpenAI.
+
+## v43.2 Smart Blocks Composer hotfix
+
+- For infographics with up to 10 cards, Composer may now render up to 3 smart blocks.
+- `important_note` smart block is skipped when the footer already contains the main safety/legal note.
+- `when_doctor` blocks are visually stronger and include `/ 112` in the title when appropriate.
+- Main footer remains reserved for the core legal/safety warning.
+
+## v43.2 Preservation-first analysis hotfix
+
+Анализатор теперь работает по принципу preservation first:
+- сохраняет категории, классификации, списки примеров и названия из исходника;
+- не удаляет полезные факты ради медицинской осторожности;
+- медицинские ограничения и юридические предупреждения переносит в smart_blocks/footer;
+- ложные или опасные утверждения исправляет минимально, не переписывая карточку с нуля;
+- short_text в карточках допускает до 130 символов, чтобы сохранять конкретику оригинала.
+
+## v43 Preservation First Examples Hotfix
+
+Изменения анализатора:
+- `medical_editorial_audit` используется только как источник для `smart_blocks/footer`, а не как причина удалять полезные факты из карточек.
+- В `replacement_review.issue` вместо широкого `medical_risk` используются более точные причины: `factual_error` и `unsafe_claim`.
+- В карточки добавлено поле `examples` для сохранения исходных списков примеров: препараты, методы, продукты, явления.
+- Composer выводит `examples` отдельной строкой `Примеры: ...`, чтобы не перегружать `short_text` и не терять конкретику.
+
+## v43.4 Hero Visual + Preservation Refinement
+
+Добавлена универсальная архитектура `hero_visual`.
+
+Что изменено:
+- анализатор ищет не список конкретных объектов, а главный визуальный якорь темы: крупный неповторяющийся объект, объясняющий всю инфографику;
+- `hero_visual` сохраняется отдельно от карточек и получает собственный `semantic_png_plan`;
+- Composer размещает первый hero PNG в header-zone справа от заголовка, а не превращает его в карточку;
+- редактура карточек ослаблена: описания категорий не переписываются без причины;
+- исправляются только `factual_error`, `unsafe_claim` или явно вводящие в заблуждение утверждения;
+- предпочтение: `preserve + clarify`, а не `rewrite + replace`;
+- примеры (`examples`) остаются обязательной core-информацией карточек.
+
+Для инфографик вроде «капли в нос» это должно сохранить не только категории и примеры препаратов, но и тематический визуальный якорь — например нос/флакон, если он есть в исходнике.
+
+## v43.5 Composer Dynamic Cards Hotfix
+
+- Composer теперь выводит `examples[]` отдельной строкой `Примеры: ...`, а не смешивает их с `short_text`.
+- Высота строк карточек рассчитывается динамически: карточки с длинным текстом и примерами получают больше места, короткие карточки — меньше.
+- Основные карточки не удаляются ради smart-блоков; если места мало, текст уменьшается, но не выходит за границы карточки.
+
+## v43.5 Compact Analysis hotfix
+
+- Сокращен output JSON без потери данных для PNG/Composer.
+- `medical_editorial_audit` больше не хранится в анализе: safety-контент живет в `smart_blocks` и `footer_blocks`.
+- `image_composition_prompt` убран из payload: Composer использует `design_blueprint` и `content_pack`.
+- `replacement_review` оставлен в ультракомпактном виде: `entity_id`, `issue`, `decision`, `replacement`.
+- `continuation_package` сокращен до минимального состояния.
+- `qa_checklist` ограничен 6 пунктами.
+
+## v43.6 Crop margin + hero multi-component extraction
+
+- Source crop safety margin increased to 20% for all Semantic PNG extraction tasks.
+- Progressive crop retry now starts from 20% and expands further when clipping is detected.
+- `hero_visual` extraction now uses multi-component cleanup: several large detached non-text components inside one hero crop can be preserved together, while text/UI fragments are still removed.
+
+## v43.5 Dynamic Layout Engine
+
+Composer теперь не просто рисует фиксированную сетку, а пересчитывает макет по содержимому:
+
+- hero visual получает полноценную верхнюю зону, а не маленькую иконку в углу;
+- для 5 карточек включается medical layout `2+2+1`: последняя карточка может занимать всю ширину;
+- `examples[]` остаются отдельной строкой внутри карточки;
+- высота строк рассчитывается по нагрузке текста и примеров;
+- smart blocks сокращаются по приоритету, если места не хватает;
+- карточки и footer имеют больший приоритет, чем декоративные/дополнительные блоки.
+
+## v43.5 Translate-first PNG extraction hotfix
+
+Исправлена архитектура извлечения Semantic PNG для случаев, когда объекты стоят близко друг к другу, а `source_crop_hint.relative_box` анализатора немного смещён.
+
+Что изменено:
+
+- глобальное расширение crop на 20% больше не используется как первый шаг;
+- сначала Python берёт bbox анализатора без расширения;
+- если foreground касается края crop, окно crop сдвигается на 5% в сторону касания без изменения размера;
+- если объект упирается сразу в две оси, crop сдвигается по обеим осям;
+- если сдвиг не помогает, включается scale fallback с мягким шагом 5%: 5% → 10% → 15% → 20% → 25%;
+- `hero_visual` сохраняет multi-component extraction: несколько крупных несвязанных объектов в одном hero PNG не удаляются как мусор.
+
+Цель: не захватывать соседние объекты при тесной сетке и одновременно не обрезать главный объект.
+
+## v43.5 crop quality diagnostics hotfix
+
+Added safer extraction after translate-first crop correction:
+
+- every extracted Semantic PNG now records extraction diagnostics in `manifest.json`;
+- the extractor checks foreground area, bbox area and aspect ratio to detect suspicious crops;
+- suspicious crops are not accepted just because they no longer touch a crop edge;
+- translate-first remains the primary strategy, scale fallback remains limited to 5–25%;
+- `hero_visual` multi-component extraction is preserved.
+
+## v43.5 Crop Validation Pipeline Hotfix
+
+- Crop is validated on the raw crop before any background cleanup.
+- Translate-first uses repeated 5% shifts until the main raw object stops touching crop edges.
+- Translation fails and scale fallback starts when the object touches opposite edges on an axis, or when the crop window cannot shift further.
+- Scale fallback expands in 5% steps: 5%, 10%, 15%, 20%, 25%.
+- Cleanup/background removal runs only after a spatially successful crop.
+- Hybrid semantic PNG tasks try source extraction first; AI generation is used only as fallback.
+
+## v43.5 Debug Failed Crop Hotfix
+
+- Removed silent/best-effort crop success: a failed crop is no longer saved as a successful Semantic PNG.
+- If translate 5–25% and scale 5–25% cannot place the raw main object fully inside the crop, the extractor saves the last/best attempt into `debug/<png_id>_debug_last_attempt.png`.
+- The manifest now records `crop_debug_saved`, `crop_debug_items`, debug path, raw touching edges, final crop box and quality metrics.
+- After a debug-saved extraction failure, normal fallback behavior can continue: hybrid/generate-capable tasks may use AI fallback, while the debug artifact remains available for inspection.
+
+## v43.5 crop diagnostics consistency hotfix
+
+- Debug PNGs (`debug_raw`, `debug_last_attempt`) are now generated from the same final debug crop box.
+- Manifest diagnostics now include `base_box` and `translate_total_shift_percent`.
+- Scale fallback now tries both the last translated box and the original analyzer bbox, then picks the first valid crop.
+- Multi-component extraction is more conservative: ordinary PNGs require several concrete physical parts in `must_include`; style details like highlights, outlines, color, text, and background do not trigger multi-component mode.
+
+## v43.6 Safe Centered Search Box
+
+Semantic PNG extraction now treats `source_crop_hint.relative_box` as a safe centered search region, not as the final tight object crop.
+
+Pipeline:
+1. Analyzer provides a centered search box with the target object inside.
+2. Python finds the foreground object inside this search region.
+3. Python derives a tighter object bbox locally.
+4. Existing translate-first and scale-fallback validation is applied to the localized bbox.
+5. Cleanup runs only after raw crop validation succeeds.
+
+Debug crop artifacts are saved and registered as `debug` artifacts when extraction still fails.
+
+## v43.6 Compact Prompt Hotfix
+
+- Сокращен prompt анализатора без изменения архитектуры.
+- Убраны дубли между системным и пользовательским prompt.
+- Сохранены ключевые правила: preservation-first, hero_visual, smart_blocks, template groups, safe centered search box.
+- `source_crop_hint.relative_box` остается областью поиска, а не tight crop.
+
+## v43.6 Foreground Gap Crop Validation
+
+- Crop validation now uses foreground gaps, not only edge pixels: a crop is accepted only when the main foreground object has background padding on all sides.
+- If top/bottom/left/right gap is smaller than ~4% of the crop axis, the object is treated as touching that side.
+- Translate-first still shifts by 5% steps toward the missing gap; opposite-side contact switches to scale fallback.
+- Scale fallback remains 5% → 10% → 15% → 20% → 25%.
+- Cleanup is performed only after raw foreground-gap validation succeeds.
+- Ordinary card PNGs use single-object cleanup; multi-component extraction is reserved for hero visuals.
+- Crop diagnostics now include `raw_gap_metrics` in addition to `raw_touch`.
+
+## v43.6 Foreground Gap Pipeline Hotfix
+
+- `source_crop_hint.relative_box` is now treated as a safe search box, not as a final object crop.
+- Foreground gap validation, translate-first, and scale fallback run on the search box first.
+- Only after the search box has valid background gaps on all sides does Python derive a tighter foreground object bbox for cleanup and PNG saving.
+- This prevents a cropped object from becoming a falsely valid new bbox.
+
+## v43.6 post-clean detached text artifact hotfix
+
+- Added final post-clean step after component cleanup and trimming.
+- Removes only small, dark, detached text/watermark/UI crumbs that are not connected to the main object.
+- Preserves colored pills, fruit, powder, spoon/shape details, shadows, and connected object parts.
+- Multi-component mode remains limited to hero visuals.
+
+## v43.7 Design Presets + Better Cards
+
+Python Composer теперь делает больше дизайна без дополнительных AI-вызовов:
+
+- добавлены `DESIGN_PRESETS`: `medical_soft`, `medical_clean`, `checklist_cards`, `warning_guide`;
+- Composer автоматически выбирает preset по типу и количеству карточек;
+- добавлен мягкий фон с простым декоративным слоем на Pillow;
+- карточки получили тень, единые рамки, image slot и более стабильные отступы;
+- `examples[]` выводятся в отдельном компактном chip-блоке;
+- добавлены простые теги карточек: `с едой`, `2 часа`, `не вместе`, `натощак`, `анализ`, `по врачу`;
+- footer использует цвета выбранного preset;
+- AI для этих элементов не используется.
+
+Заменить на GitHub:
+
+```text
+app/services/semantic_assets.py
+README.md
+```
+
+## v43.7 Design Presets Hotfix
+
+- Fixed header rendering bug: `design_preset` is now used consistently inside `compose_reconstruction()`.
+- Smart blocks now inherit accent/text colors from the active design preset so they visually match cards, header and footer.
+- Card tags are disabled automatically for compact cards below 180 px height to prevent layout clutter.
+- Background decor can be disabled by preset via `decor_enabled=False`.
+- ZIP verified and `app/` compiles.
+
+Заменить на GitHub:
+
+```text
+app/services/semantic_assets.py
+README.md
+```
+
+## v43.8 Multi-Visual Cards
+
+Добавлена поддержка карточек с двумя смысловыми иллюстрациями: например препарат + симптом/орган/состояние.
+
+- Анализатор должен создавать отдельные `visual_entity` и `semantic_png_plan` для каждой смысловой картинки.
+- В карточке можно указать `primary_png_id`, `secondary_png_id`, `png_ids` или `visuals[].png_id`.
+- `png_id` остаётся обратносуместимым primary PNG.
+- Composer рисует primary PNG как главный визуал, secondary PNG — как дополнительный маленький визуал в той же карточке.
+
+
+## v43.9 Lightweight classifier + compact reconstruction
+
+- Первый AI-вызов (`pattern_analyzer`) теперь является лёгким классификатором и возвращает только JSON: `content_type`, `confidence`, `reconstructable`.
+- Поддерживаемые типы первого вызова: `infographic`, `text_post`, `meme`, `image_post`, `other`.
+- Второй AI-вызов (`semantic_reconstruction`) получает JSON первого вызова через `content_type_json_from_first_call` и строит реконструкцию согласно определённому типу.
+- На текущем этапе полноценно реконструируются инфографические типы: `infographic`, `checklist`, `table`, `scheme`, `mixed_visual`.
+- Semantic prompt сокращён: удалены устаревшие длинные блоки, дубли и старые audit/composition инструкции без потери текущей архитектуры: preservation-first, smart blocks, safe centered search box, foreground gap crop validation, design presets, multi-visual cards.
+
+## v43.9 Multi-visual link + contour cleanup hotfix
+
+- Strengthened analyzer rule: paired rows such as `medicine/product + symptom/organ` must link both PNGs to one card via `primary_png_id`, `secondary_png_id` and `png_ids`.
+- `compact_semantic_payload()` now preserves `primary_png_id`, `secondary_png_id`, `png_ids` and `visuals` instead of stripping them during JSON compaction.
+- Composer normalizes card PNG links and can infer the common pattern `comparison_item -> visual_explanation` when older JSON has orphan secondary PNGs.
+- Background removal is more conservative for light objects on warm paper backgrounds.
+- Added alpha-hole restoration after edge flood-fill so white tubes/bottles are not hollowed out when their body resembles the page background.
+
+Заменить на GitHub:
+
+```text
+app/prompts/semantic_reconstruction.py
+app/services/semantic_reconstruction_engine.py
+app/services/semantic_assets.py
+README.md
+```
+
+## v43.9 Object Contour First Cleanup
+
+Added contour-first background cleanup for semantic PNG extraction:
+
+- Python now tries to detect an external object contour before removing background.
+- Pixels outside the contour are removed; pixels inside the object contour are preserved.
+- This avoids erasing white/light parts of objects, such as white ointment tubes, bottle highlights and package interiors.
+- The older edge-aware background fill remains as a fallback when contour detection is too weak.
+
+## v44.1 Content Intake MVP
+
+Добавлен первый слой контент-оператора: загрузка готового контента через Telegram, сохранение в PostgreSQL и экспорт исходников ZIP для ручной публикации.
+
+### Новые команды Telegram
+
+- `/new_post` — загрузить готовый материал в базу. После команды отправьте текст, изображение с caption, видео или документ.
+- `/content` — показать последние загруженные материалы.
+- `/content_12` — открыть карточку материала по ID.
+- `/export_content 12` — скачать ZIP с исходным текстом, файлами и metadata.
+
+### Новые таблицы
+
+- `intake_content_items` — карточки загруженного контента.
+- `intake_content_files` — файлы, связанные с карточкой контента.
+
+### Ограничения MVP
+
+- Альбомы Telegram пока сохраняются как отдельные сообщения.
+- Адаптация под соцсети будет в v44.2.
+- Автопубликация по API пока не включена: экспорт предназначен для ручной публикации.
